@@ -63,6 +63,7 @@ RUN apt-get update \
     make \
     procps \
     psmisc \
+    tini \
     file \
     git \
     python3 \
@@ -104,4 +105,10 @@ COPY src ./src
 
 ENV PORT=8080
 EXPOSE 8080
+
+# Run under tini as PID 1 so orphaned grandchildren get reaped.
+# Node does not reap adopted orphans, so gateway subprocesses (subagents,
+# plugins, cron shell jobs) accumulated as zombies until the next redeploy.
+# -g forwards signals to the whole process group for clean shutdowns.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["node", "src/server.js"]
