@@ -2285,6 +2285,166 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
+// ========== TAILSCALE BOOT ==========
+
+// Railway containers get no /dev/net/tun and no CAP_NET_ADMIN, so tailscaled
+// runs with --tun=userspace-networking. In that mode netstack forwards inbound
+// tailnet connections to 127.0.0.1 on the same port, which is what makes this
+// wrapper -- and anything else bound to loopback -- privately reachable.
+//
+// Node state is kept on the /data volume so a redeploy reconnects as the SAME
+// node. Without that, every rebuild mints a new node, spends another auth key,
+// and litters the admin console with dead hosts.
+const TS_STATE_DIR = process.env.TS_STATE_DIR?.trim() || "/data/tailscale";
+const TS_HOSTNAME = process.env.TS_HOSTNAME?.trim() || "openclaw-railway";
+
+let tailscaledProc = null;
+
+// runCmd folds stderr into its output, so scrub keys before anything is logged.
+function redactAuthKey(text) {
+  return String(text).replace(/tskey-[A-Za-z0-9-]+/g, "tskey-***");
+}
+
+function spawnTailscaled() {
+  // Boot and the setup wizard can both reach here; a second daemon on the same
+  // state dir would fight the first over the socket and the state file.
+  if (tailscaledProc && tailscaledProc.exitCode === null) {
+    debug("[tailscale] tailscaled already running; reusing");
+    return tailscaledProc;
+  }
+
+  try {
+    fs.mkdirSync(TS_STATE_DIR, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    console.error(`[tailscale] cannot create ${TS_STATE_DIR}: ${err.message}`);
+  }
+
+  console.log(
+    `[tailscale] starting tailscaled (userspace, state=${TS_STATE_DIR})`,
+  );
+  tailscaledProc = childProcess.spawn(
+    "tailscaled",
+    [
+      "--tun=userspace-networking",
+      `--statedir=${TS_STATE_DIR}`,
+      "--socks5-server=localhost:1055",
+      "--outbound-http-proxy-listen=localhost:1055",
+    ],
+    { detached: false, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  tailscaledProc.stdout?.on("data", (d) =>
+    debug(`[tailscaled] ${d.toString().trim()}`),
+  );
+  tailscaledProc.stderr?.on("data", (d) =>
+    debug(`[tailscaled] ${d.toString().trim()}`),
+  );
+  tailscaledProc.on("exit", (code, signal) => {
+    console.error(
+      `[tailscale] tailscaled exited (code=${code}, signal=${signal})`,
+    );
+    tailscaledProc = null;
+  });
+  return tailscaledProc;
+}
+
+// `tailscale status --json` exits non-zero while logged out but still prints a
+// body, so a parseable BackendState -- not the exit code -- is the readiness
+// signal.
+async function tailscaleBackendState() {
+  const r = await runCmd("tailscale", ["status", "--json"], {
+    timeoutMs: 5000,
+  });
+  try {
+    return JSON.parse(r.output)?.BackendState || null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForTailscaled(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await tailscaleBackendState()) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// Runs at boot. No-ops unless TS_AUTHKEY is set or a previous login is already
+// on the volume, so the image stays inert for deployments that do not use
+// Tailscale.
+async function startTailscaleFromEnv() {
+  const authKey = process.env.TS_AUTHKEY?.trim();
+  const hasState = fs.existsSync(path.join(TS_STATE_DIR, "tailscaled.state"));
+  if (!authKey && !hasState) {
+    debug("[tailscale] no TS_AUTHKEY and no saved state; not starting");
+    return;
+  }
+  if (!(await isTailscaleInstalled())) {
+    console.error("[tailscale] tailscale binary missing from image; skipping");
+    return;
+  }
+
+  spawnTailscaled();
+  if (!(await waitForTailscaled())) {
+    console.error("[tailscale] tailscaled did not become ready within 30s");
+    return;
+  }
+
+  // Only spend the auth key when actually logged out: a single-use key then
+  // covers exactly one boot, and later restarts reuse the saved node key.
+  const needsLogin = (await tailscaleBackendState()) === "NeedsLogin";
+  if (needsLogin && !authKey) {
+    console.error(
+      "[tailscale] node is logged out and TS_AUTHKEY is unset; set it in Railway Variables",
+    );
+    return;
+  }
+
+  const args = ["up", `--hostname=${TS_HOSTNAME}`, "--accept-dns=false"];
+  if (needsLogin) args.push(`--authkey=${authKey}`);
+  const up = await runCmd("tailscale", args, { timeoutMs: 60000 });
+  if (up.code !== 0) {
+    console.error(`[tailscale] up failed: ${redactAuthKey(up.output)}`);
+    return;
+  }
+
+  const status = await runCmd("tailscale", ["status", "--json"], {
+    timeoutMs: 10000,
+  });
+  try {
+    const self = JSON.parse(status.output)?.Self || {};
+    const ip = (self.TailscaleIPs || [])[0] || "unknown";
+    console.log(
+      `[tailscale] connected as ${self.HostName || TS_HOSTNAME} (${ip})`,
+    );
+    console.log(`[tailscale] wrapper reachable at http://${ip}:${PORT}`);
+  } catch {
+    console.log("[tailscale] connected");
+  }
+
+  await startTailscaleServe();
+}
+
+// Optional front door: https://<host>.<tailnet>.ts.net with no port. Needs
+// HTTPS certificates enabled for the tailnet, so failure is logged and ignored
+// -- http://<tailscale-ip>:PORT keeps working either way.
+async function startTailscaleServe() {
+  if (process.env.TS_SERVE_HTTPS === "0") return;
+  const r = await runCmd(
+    "tailscale",
+    ["serve", "--bg", "--https=443", `http://127.0.0.1:${PORT}`],
+    { timeoutMs: 30000 },
+  );
+  if (r.code === 0) {
+    console.log(`[tailscale] tailnet HTTPS front door up (443 -> ${PORT})`);
+  } else {
+    console.warn(
+      `[tailscale] serve unavailable (enable HTTPS certs for the tailnet to use it): ${r.output.trim()}`,
+    );
+  }
+}
+
 // ========== TAILSCALE API ENDPOINTS ==========
 
 // Helper: check if Tailscale is installed
@@ -2397,16 +2557,7 @@ app.post(
       if (statusCheck.code !== 0) {
         console.log("[tailscale] Starting tailscaled daemon...");
         // Run tailscaled in background (userspace networking for containers)
-        childProcess
-          .spawn(
-            "tailscaled",
-            ["--tun=userspace-networking", "--socks5-server=localhost:1055"],
-            {
-              detached: true,
-              stdio: "ignore",
-            },
-          )
-          .unref();
+        spawnTailscaled();
         await sleep(2000);
       }
 
@@ -2851,6 +3002,12 @@ const server = app.listen(PORT, async () => {
     fs.chmodSync(path.join(STATE_DIR, "credentials"), 0o700);
   } catch {}
 
+  // Bring Tailscale up in the background: a slow login must never delay the
+  // gateway, and a rejected auth key must never take down PID 1.
+  startTailscaleFromEnv().catch((err) => {
+    console.error(`[tailscale] boot failed: ${String(err)}`);
+  });
+
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
   if (isConfigured()) {
@@ -2914,6 +3071,17 @@ process.on("SIGTERM", async () => {
   if (healthMonitorInterval) {
     clearInterval(healthMonitorInterval);
     healthMonitorInterval = null;
+  }
+
+  // Stop tailscaled
+  if (tailscaledProc) {
+    console.log("[shutdown] Stopping tailscaled...");
+    try {
+      tailscaledProc.kill("SIGTERM");
+      tailscaledProc = null;
+    } catch (err) {
+      console.error(`[shutdown] Failed to stop tailscaled: ${err.message}`);
+    }
   }
 
   // Stop gateway process
