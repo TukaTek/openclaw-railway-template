@@ -2338,6 +2338,13 @@ function spawnTailscaled() {
   tailscaledProc.stderr?.on("data", (d) =>
     debug(`[tailscaled] ${d.toString().trim()}`),
   );
+  // An unhandled 'error' event on a ChildProcess throws, and this process is
+  // PID 1. A missing binary or a failed exec must degrade to a log line, not
+  // take the whole container down with it.
+  tailscaledProc.on("error", (err) => {
+    console.error(`[tailscale] failed to spawn tailscaled: ${err.message}`);
+    tailscaledProc = null;
+  });
   tailscaledProc.on("exit", (code, signal) => {
     console.error(
       `[tailscale] tailscaled exited (code=${code}, signal=${signal})`,
