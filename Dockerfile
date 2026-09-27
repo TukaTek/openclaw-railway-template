@@ -71,9 +71,25 @@ RUN apt-get update \
     sudo \
   && rm -rf /var/lib/apt/lists/*
 
-# NOTE: Tailscale is NOT installed by default to keep the image lean.
-# It will be installed on-demand via the Setup Wizard if the user enables it.
-# To pre-install, uncomment: RUN curl -fsSL https://tailscale.com/install.sh | sh
+# Tailscale, baked into the image.
+#
+# Railway gives containers no /dev/net/tun and no CAP_NET_ADMIN, so tailscaled
+# must run with --tun=userspace-networking. In that mode netstack forwards
+# inbound tailnet connections to 127.0.0.1 on the same port, so the wrapper on
+# :8080 becomes reachable privately from the tailnet with no extra plumbing.
+#
+# Installed from the official apt repo rather than a piped install script so the
+# layer is cached and reproducible. The wrapper starts the daemon at boot and
+# keeps node state on the /data volume, so redeploys reuse the node identity and
+# the auth key is consumed exactly once.
+RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg \
+      -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
+  && curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list \
+      -o /etc/apt/sources.list.d/tailscale.list \
+  && apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    tailscale \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install Homebrew (must run as non-root user)
 # Create a user for Homebrew installation, install it, then make it accessible to all users

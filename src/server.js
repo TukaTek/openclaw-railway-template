@@ -2285,6 +2285,216 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
+// ========== TAILSCALE BOOT ==========
+
+// Railway containers get no /dev/net/tun and no CAP_NET_ADMIN, so tailscaled
+// runs with --tun=userspace-networking. In that mode netstack forwards inbound
+// tailnet connections to 127.0.0.1 on the same port, which is what makes this
+// wrapper -- and anything else bound to loopback -- privately reachable.
+//
+// Node state is kept on the /data volume so a redeploy reconnects as the SAME
+// node. Without that, every rebuild mints a new node, spends another auth key,
+// and litters the admin console with dead hosts.
+const TS_STATE_DIR = process.env.TS_STATE_DIR?.trim() || "/data/tailscale";
+const TS_HOSTNAME = process.env.TS_HOSTNAME?.trim() || "openclaw-railway";
+
+let tailscaledProc = null;
+
+// runCmd folds stderr into its output, so scrub keys before anything is logged.
+function redactAuthKey(text) {
+  return String(text).replace(/tskey-[A-Za-z0-9-]+/g, "tskey-***");
+}
+
+function spawnTailscaled() {
+  // Boot and the setup wizard can both reach here; a second daemon on the same
+  // state dir would fight the first over the socket and the state file.
+  if (tailscaledProc && tailscaledProc.exitCode === null) {
+    debug("[tailscale] tailscaled already running; reusing");
+    return tailscaledProc;
+  }
+
+  try {
+    fs.mkdirSync(TS_STATE_DIR, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    console.error(`[tailscale] cannot create ${TS_STATE_DIR}: ${err.message}`);
+  }
+
+  console.log(
+    `[tailscale] starting tailscaled (userspace, state=${TS_STATE_DIR})`,
+  );
+  tailscaledProc = childProcess.spawn(
+    "tailscaled",
+    [
+      "--tun=userspace-networking",
+      `--statedir=${TS_STATE_DIR}`,
+      "--socks5-server=localhost:1055",
+      "--outbound-http-proxy-listen=localhost:1055",
+    ],
+    { detached: false, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  tailscaledProc.stdout?.on("data", (d) =>
+    debug(`[tailscaled] ${d.toString().trim()}`),
+  );
+  tailscaledProc.stderr?.on("data", (d) =>
+    debug(`[tailscaled] ${d.toString().trim()}`),
+  );
+  // An unhandled 'error' event on a ChildProcess throws, and this process is
+  // PID 1. A missing binary or a failed exec must degrade to a log line, not
+  // take the whole container down with it.
+  tailscaledProc.on("error", (err) => {
+    console.error(`[tailscale] failed to spawn tailscaled: ${err.message}`);
+    tailscaledProc = null;
+  });
+  tailscaledProc.on("exit", (code, signal) => {
+    console.error(
+      `[tailscale] tailscaled exited (code=${code}, signal=${signal})`,
+    );
+    tailscaledProc = null;
+  });
+  return tailscaledProc;
+}
+
+// `tailscale status --json` exits non-zero while logged out but still prints a
+// body, so a parseable BackendState -- not the exit code -- is the readiness
+// signal.
+async function tailscaleBackendState() {
+  const r = await runCmd("tailscale", ["status", "--json"], {
+    timeoutMs: 5000,
+  });
+  try {
+    return JSON.parse(r.output)?.BackendState || null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForTailscaled(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await tailscaleBackendState()) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// Runs at boot. No-ops unless TS_AUTHKEY is set or a previous login is already
+// on the volume, so the image stays inert for deployments that do not use
+// Tailscale.
+async function startTailscaleFromEnv() {
+  const authKey = process.env.TS_AUTHKEY?.trim();
+  const hasState = fs.existsSync(path.join(TS_STATE_DIR, "tailscaled.state"));
+  if (!authKey && !hasState) {
+    debug("[tailscale] no TS_AUTHKEY and no saved state; not starting");
+    return;
+  }
+  if (!(await isTailscaleInstalled())) {
+    console.error("[tailscale] tailscale binary missing from image; skipping");
+    return;
+  }
+
+  spawnTailscaled();
+  if (!(await waitForTailscaled())) {
+    console.error("[tailscale] tailscaled did not become ready within 30s");
+    return;
+  }
+
+  // Only spend the auth key when actually logged out: a single-use key then
+  // covers exactly one boot, and later restarts reuse the saved node key.
+  const needsLogin = (await tailscaleBackendState()) === "NeedsLogin";
+  if (needsLogin && !authKey) {
+    console.error(
+      "[tailscale] node is logged out and TS_AUTHKEY is unset; set it in Railway Variables",
+    );
+    return;
+  }
+
+  const args = ["up", `--hostname=${TS_HOSTNAME}`, "--accept-dns=false"];
+  if (needsLogin) args.push(`--authkey=${authKey}`);
+  const up = await runCmd("tailscale", args, { timeoutMs: 60000 });
+  if (up.code !== 0) {
+    console.error(`[tailscale] up failed: ${redactAuthKey(up.output)}`);
+    return;
+  }
+
+  const status = await runCmd("tailscale", ["status", "--json"], {
+    timeoutMs: 10000,
+  });
+  try {
+    const self = JSON.parse(status.output)?.Self || {};
+    const ip = (self.TailscaleIPs || [])[0] || "";
+    // MagicDNS names carry a trailing dot; strip it so the value drops
+    // straight into a URL.
+    const dnsName = String(self.DNSName || "").replace(/[.]$/, "");
+    const hostname = self.HostName || TS_HOSTNAME;
+
+    writeNodeInfo({ hostname, dnsName, ip });
+
+    console.log(`[tailscale] connected as ${hostname} (${ip || "no IP yet"})`);
+    if (ip) {
+      console.log(`[tailscale] wrapper reachable at http://${ip}:${PORT}`);
+    }
+    if (dnsName) {
+      console.log(`[tailscale] and at http://${dnsName}:${PORT}`);
+    }
+  } catch (err) {
+    console.log(`[tailscale] connected (status unparseable: ${err.message})`);
+  }
+
+  await startTailscaleServe();
+}
+
+// Publish the node's tailnet identity where agents running inside this
+// container can read it.
+//
+// Anything they serve on a loopback port is reachable from the tailnet, but
+// only if the links they hand out name the tailnet host. A generated link to
+// http://localhost:9000/report.pdf is useless on the machine doing the
+// clicking; http://zaphod:9000/report.pdf just works.
+function writeNodeInfo(info) {
+  const target = path.join(TS_STATE_DIR, "node.json");
+  const body = {
+    hostname: info.hostname,
+    dnsName: info.dnsName || null,
+    ip: info.ip || null,
+    wrapperPort: PORT,
+    linkBase: info.dnsName
+      ? `http://${info.dnsName}`
+      : info.ip
+        ? `http://${info.ip}`
+        : null,
+    note:
+      "Any port bound on 127.0.0.1 in this container is reachable from the " +
+      "tailnet at <linkBase>:<port>. Build document links from linkBase, " +
+      "never from localhost.",
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    fs.writeFileSync(target, `${JSON.stringify(body, null, 2)}\n`);
+    console.log(`[tailscale] node info written to ${target}`);
+  } catch (err) {
+    console.error(`[tailscale] could not write ${target}: ${err.message}`);
+  }
+}
+
+// Optional front door: https://<host>.<tailnet>.ts.net with no port. Needs
+// HTTPS certificates enabled for the tailnet, so failure is logged and ignored
+// -- http://<tailscale-ip>:PORT keeps working either way.
+async function startTailscaleServe() {
+  if (process.env.TS_SERVE_HTTPS === "0") return;
+  const r = await runCmd(
+    "tailscale",
+    ["serve", "--bg", "--https=443", `http://127.0.0.1:${PORT}`],
+    { timeoutMs: 30000 },
+  );
+  if (r.code === 0) {
+    console.log(`[tailscale] tailnet HTTPS front door up (443 -> ${PORT})`);
+  } else {
+    console.warn(
+      `[tailscale] serve unavailable (enable HTTPS certs for the tailnet to use it): ${r.output.trim()}`,
+    );
+  }
+}
+
 // ========== TAILSCALE API ENDPOINTS ==========
 
 // Helper: check if Tailscale is installed
@@ -2397,16 +2607,7 @@ app.post(
       if (statusCheck.code !== 0) {
         console.log("[tailscale] Starting tailscaled daemon...");
         // Run tailscaled in background (userspace networking for containers)
-        childProcess
-          .spawn(
-            "tailscaled",
-            ["--tun=userspace-networking", "--socks5-server=localhost:1055"],
-            {
-              detached: true,
-              stdio: "ignore",
-            },
-          )
-          .unref();
+        spawnTailscaled();
         await sleep(2000);
       }
 
@@ -2585,6 +2786,53 @@ const proxy = httpProxy.createProxyServer({
 
 // Prevent proxy errors from crashing the wrapper.
 // Common errors: ECONNREFUSED (gateway not ready), ECONNRESET (client disconnect).
+// http-proxy hands this callback an http.ServerResponse when an ordinary HTTP
+// request fails, but the RAW net.Socket when a WebSocket upgrade fails. The two
+// are not interchangeable: a Socket has no headersSent (so `!res.headersSent`
+// is true) and no writeHead, so calling writeHead on one throws a TypeError --
+// uncaught, inside PID 1, which is fatal for the whole container.
+//
+// The trigger is ordinary: the gateway takes ~90s to boot, and any browser tab
+// reconnecting its WebSocket in that window gets ECONNREFUSED and lands here.
+function isServerResponse(target) {
+  return Boolean(target) && typeof target.writeHead === "function";
+}
+
+// Reply on either shape. Never throws: every path a proxy error can take ends
+// in a log line, not an exception.
+function respondProxyError(target, status, reason, body) {
+  if (isServerResponse(target)) {
+    if (target.headersSent) return;
+    try {
+      target.writeHead(status, { "Content-Type": "text/plain" });
+      target.end(body);
+    } catch {
+      // Response already partially sent, can't recover.
+    }
+    return;
+  }
+
+  // Raw socket from a failed upgrade: speak HTTP/1.1 at it directly, then close.
+  if (!target || typeof target.write !== "function") return;
+  try {
+    target.write(
+      `HTTP/1.1 ${status} ${reason}\r\n` +
+        "Content-Type: text/plain\r\n" +
+        "Connection: close\r\n" +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        "\r\n" +
+        body,
+    );
+  } catch {
+    // Socket already gone.
+  }
+  try {
+    target.destroy();
+  } catch {
+    // Already destroyed.
+  }
+}
+
 proxy.on("error", (err, req, res) => {
   // Suppress ECONNREFUSED spam during normal gateway startup
   if (
@@ -2594,38 +2842,31 @@ proxy.on("error", (err, req, res) => {
     debug(
       `[proxy] Suppressed ECONNREFUSED during startup (${req?.method} ${req?.url})`,
     );
-    // Don't log or respond - gateway is still booting, this is expected
-    if (res && !res.headersSent) {
-      res.writeHead(503, { "Content-Type": "text/plain" });
-      res.end("Gateway is starting up, please wait...");
-    }
+    respondProxyError(
+      res,
+      503,
+      "Service Unavailable",
+      "Gateway is starting up, please wait...",
+    );
     return;
   }
 
   console.error("[proxy] error:", err.message, `(${req?.method} ${req?.url})`);
 
-  // Only send error response if headers haven't been sent yet
-  if (res && !res.headersSent) {
-    try {
-      const troubleshooting = [
-        `Proxy error: ${err.message}`,
-        "",
-        "Gateway may not be ready or has crashed.",
-        "",
-        "Troubleshooting:",
-        "- Visit /healthz for gateway status",
-        "- Visit /startup-status for boot progress",
-        "- Visit /setup/api/debug for full diagnostics",
-        "- Check Debug Console in /setup",
-        "- Run 'gateway.restart' in Debug Console",
-      ].join("\n");
+  const troubleshooting = [
+    `Proxy error: ${err.message}`,
+    "",
+    "Gateway may not be ready or has crashed.",
+    "",
+    "Troubleshooting:",
+    "- Visit /healthz for gateway status",
+    "- Visit /startup-status for boot progress",
+    "- Visit /setup/api/debug for full diagnostics",
+    "- Check Debug Console in /setup",
+    "- Run 'gateway.restart' in Debug Console",
+  ].join("\n");
 
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end(troubleshooting);
-    } catch {
-      // Response already partially sent, can't recover
-    }
-  }
+  respondProxyError(res, 502, "Bad Gateway", troubleshooting);
 
   // Don't throw - just log and continue
 });
@@ -2851,6 +3092,12 @@ const server = app.listen(PORT, async () => {
     fs.chmodSync(path.join(STATE_DIR, "credentials"), 0o700);
   } catch {}
 
+  // Bring Tailscale up in the background: a slow login must never delay the
+  // gateway, and a rejected auth key must never take down PID 1.
+  startTailscaleFromEnv().catch((err) => {
+    console.error(`[tailscale] boot failed: ${String(err)}`);
+  });
+
   // Auto-start the gateway if already configured so polling channels (Telegram/Discord/etc.)
   // work even if nobody visits the web UI.
   if (isConfigured()) {
@@ -2914,6 +3161,17 @@ process.on("SIGTERM", async () => {
   if (healthMonitorInterval) {
     clearInterval(healthMonitorInterval);
     healthMonitorInterval = null;
+  }
+
+  // Stop tailscaled
+  if (tailscaledProc) {
+    console.log("[shutdown] Stopping tailscaled...");
+    try {
+      tailscaledProc.kill("SIGTERM");
+      tailscaledProc = null;
+    } catch (err) {
+      console.error(`[shutdown] Failed to stop tailscaled: ${err.message}`);
+    }
   }
 
   // Stop gateway process
