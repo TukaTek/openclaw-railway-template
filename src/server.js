@@ -2786,6 +2786,53 @@ const proxy = httpProxy.createProxyServer({
 
 // Prevent proxy errors from crashing the wrapper.
 // Common errors: ECONNREFUSED (gateway not ready), ECONNRESET (client disconnect).
+// http-proxy hands this callback an http.ServerResponse when an ordinary HTTP
+// request fails, but the RAW net.Socket when a WebSocket upgrade fails. The two
+// are not interchangeable: a Socket has no headersSent (so `!res.headersSent`
+// is true) and no writeHead, so calling writeHead on one throws a TypeError --
+// uncaught, inside PID 1, which is fatal for the whole container.
+//
+// The trigger is ordinary: the gateway takes ~90s to boot, and any browser tab
+// reconnecting its WebSocket in that window gets ECONNREFUSED and lands here.
+function isServerResponse(target) {
+  return Boolean(target) && typeof target.writeHead === "function";
+}
+
+// Reply on either shape. Never throws: every path a proxy error can take ends
+// in a log line, not an exception.
+function respondProxyError(target, status, reason, body) {
+  if (isServerResponse(target)) {
+    if (target.headersSent) return;
+    try {
+      target.writeHead(status, { "Content-Type": "text/plain" });
+      target.end(body);
+    } catch {
+      // Response already partially sent, can't recover.
+    }
+    return;
+  }
+
+  // Raw socket from a failed upgrade: speak HTTP/1.1 at it directly, then close.
+  if (!target || typeof target.write !== "function") return;
+  try {
+    target.write(
+      `HTTP/1.1 ${status} ${reason}\r\n` +
+        "Content-Type: text/plain\r\n" +
+        "Connection: close\r\n" +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        "\r\n" +
+        body,
+    );
+  } catch {
+    // Socket already gone.
+  }
+  try {
+    target.destroy();
+  } catch {
+    // Already destroyed.
+  }
+}
+
 proxy.on("error", (err, req, res) => {
   // Suppress ECONNREFUSED spam during normal gateway startup
   if (
@@ -2795,38 +2842,31 @@ proxy.on("error", (err, req, res) => {
     debug(
       `[proxy] Suppressed ECONNREFUSED during startup (${req?.method} ${req?.url})`,
     );
-    // Don't log or respond - gateway is still booting, this is expected
-    if (res && !res.headersSent) {
-      res.writeHead(503, { "Content-Type": "text/plain" });
-      res.end("Gateway is starting up, please wait...");
-    }
+    respondProxyError(
+      res,
+      503,
+      "Service Unavailable",
+      "Gateway is starting up, please wait...",
+    );
     return;
   }
 
   console.error("[proxy] error:", err.message, `(${req?.method} ${req?.url})`);
 
-  // Only send error response if headers haven't been sent yet
-  if (res && !res.headersSent) {
-    try {
-      const troubleshooting = [
-        `Proxy error: ${err.message}`,
-        "",
-        "Gateway may not be ready or has crashed.",
-        "",
-        "Troubleshooting:",
-        "- Visit /healthz for gateway status",
-        "- Visit /startup-status for boot progress",
-        "- Visit /setup/api/debug for full diagnostics",
-        "- Check Debug Console in /setup",
-        "- Run 'gateway.restart' in Debug Console",
-      ].join("\n");
+  const troubleshooting = [
+    `Proxy error: ${err.message}`,
+    "",
+    "Gateway may not be ready or has crashed.",
+    "",
+    "Troubleshooting:",
+    "- Visit /healthz for gateway status",
+    "- Visit /startup-status for boot progress",
+    "- Visit /setup/api/debug for full diagnostics",
+    "- Check Debug Console in /setup",
+    "- Run 'gateway.restart' in Debug Console",
+  ].join("\n");
 
-      res.writeHead(502, { "Content-Type": "text/plain" });
-      res.end(troubleshooting);
-    } catch {
-      // Response already partially sent, can't recover
-    }
-  }
+  respondProxyError(res, 502, "Bad Gateway", troubleshooting);
 
   // Don't throw - just log and continue
 });
