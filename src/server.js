@@ -2414,16 +2414,59 @@ async function startTailscaleFromEnv() {
   });
   try {
     const self = JSON.parse(status.output)?.Self || {};
-    const ip = (self.TailscaleIPs || [])[0] || "unknown";
-    console.log(
-      `[tailscale] connected as ${self.HostName || TS_HOSTNAME} (${ip})`,
-    );
-    console.log(`[tailscale] wrapper reachable at http://${ip}:${PORT}`);
-  } catch {
-    console.log("[tailscale] connected");
+    const ip = (self.TailscaleIPs || [])[0] || "";
+    // MagicDNS names carry a trailing dot; strip it so the value drops
+    // straight into a URL.
+    const dnsName = String(self.DNSName || "").replace(/[.]$/, "");
+    const hostname = self.HostName || TS_HOSTNAME;
+
+    writeNodeInfo({ hostname, dnsName, ip });
+
+    console.log(`[tailscale] connected as ${hostname} (${ip || "no IP yet"})`);
+    if (ip) {
+      console.log(`[tailscale] wrapper reachable at http://${ip}:${PORT}`);
+    }
+    if (dnsName) {
+      console.log(`[tailscale] and at http://${dnsName}:${PORT}`);
+    }
+  } catch (err) {
+    console.log(`[tailscale] connected (status unparseable: ${err.message})`);
   }
 
   await startTailscaleServe();
+}
+
+// Publish the node's tailnet identity where agents running inside this
+// container can read it.
+//
+// Anything they serve on a loopback port is reachable from the tailnet, but
+// only if the links they hand out name the tailnet host. A generated link to
+// http://localhost:9000/report.pdf is useless on the machine doing the
+// clicking; http://zaphod:9000/report.pdf just works.
+function writeNodeInfo(info) {
+  const target = path.join(TS_STATE_DIR, "node.json");
+  const body = {
+    hostname: info.hostname,
+    dnsName: info.dnsName || null,
+    ip: info.ip || null,
+    wrapperPort: PORT,
+    linkBase: info.dnsName
+      ? `http://${info.dnsName}`
+      : info.ip
+        ? `http://${info.ip}`
+        : null,
+    note:
+      "Any port bound on 127.0.0.1 in this container is reachable from the " +
+      "tailnet at <linkBase>:<port>. Build document links from linkBase, " +
+      "never from localhost.",
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    fs.writeFileSync(target, `${JSON.stringify(body, null, 2)}\n`);
+    console.log(`[tailscale] node info written to ${target}`);
+  } catch (err) {
+    console.error(`[tailscale] could not write ${target}: ${err.message}`);
+  }
 }
 
 // Optional front door: https://<host>.<tailnet>.ts.net with no port. Needs
