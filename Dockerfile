@@ -35,12 +35,22 @@ RUN set -eu; \
   fi; \
   git clone --depth 1 --branch "${REF}" https://github.com/openclaw/openclaw.git .
 
-# Patch: relax version requirements for packages that may reference unpublished versions.
-# Apply to all extension package.json files to handle workspace protocol (workspace:*).
+# Patch: resolve every extension's `openclaw` dependency from the WORKSPACE,
+# not from npm.
+#
+# Extensions declare `"openclaw": ">=<version>"`. Rewriting that to `"*"` (as
+# this step used to) makes pnpm resolve it from the npm registry to whatever is
+# newest, which silently overrides the tag cloned above -- OPENCLAW_VERSION then
+# pins the source but not the dependency. That went unnoticed while npm's latest
+# happened to be compatible; it broke outright once the newest release raised its
+# Node floor above this image's runtime.
+#
+# pnpm-workspace.yaml lists "." and the repository root IS the openclaw package,
+# so `workspace:*` resolves to exactly the cloned tag and never touches npm.
 RUN set -eux; \
   find ./extensions -name 'package.json' -type f | while read -r f; do \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "workspace:*"/g' "$f"; \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"\^?[0-9][^"]*"/"openclaw": "workspace:*"/g' "$f"; \
   done
 
 RUN pnpm install --no-frozen-lockfile
